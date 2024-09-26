@@ -391,6 +391,10 @@ class SamplingTensors:
     extra_seeds: Optional[torch.Tensor]
     prompt_tokens: torch.Tensor
     output_tokens: torch.Tensor
+    dry_multipliers: torch.Tensor
+    dry_bases: torch.Tensor
+    dry_allowed_lengths: torch.Tensor
+    dry_sequence_breakers: torch.Tensor
 
     @classmethod
     def from_sampling_metadata(
@@ -403,7 +407,7 @@ class SamplingTensors:
         extra_seeds_to_generate: int = 0,
         extra_entropy: Optional[Tuple[int, ...]] = None
     ) -> Tuple["SamplingTensors", bool, bool, bool, bool, bool, bool, bool,
-               bool, bool, bool, bool, bool]:
+               bool, bool, bool, bool, bool, bool]: 
         """
         extra_seeds_to_generate: extra seeds to generate using the
             user-defined seed for each sequence.
@@ -445,6 +449,11 @@ class SamplingTensors:
         do_quadratic = False
         do_xtc = False
         do_temp_last = False
+        dry_multipliers: List[float] = []
+        dry_bases: List[float] = []
+        dry_allowed_lengths: List[int] = []
+        dry_sequence_breakers: List[str] = []
+        do_dry = False
 
         if _USE_TRITON_SAMPLER:
             prompt_best_of: List[int] = []
@@ -476,6 +485,10 @@ class SamplingTensors:
             smoothing_curve = sampling_params.smoothing_curve
             xtc_threshold = sampling_params.xtc_threshold
             xtc_probability = sampling_params.xtc_probability
+            dry_multiplier = sampling_params.dry_multiplier
+            dry_base = sampling_params.dry_base
+            dry_allowed_length = sampling_params.dry_allowed_length
+            dry_sequence_breakers = sampling_params.dry_sequence_breakers
 
             # k should not be greater than the vocab size.
             top_k = min(sampling_params.top_k, vocab_size)
@@ -513,6 +526,8 @@ class SamplingTensors:
                 do_xtc = True
             if do_temp_last is False and temperature_last:
                 do_temp_last = True
+            if not do_dry and dry_multiplier > 0:
+                do_dry = True
 
             is_prompt = seq_group.is_prompt
             if (is_prompt and sampling_params.prompt_logprobs is not None):
@@ -541,6 +556,10 @@ class SamplingTensors:
                 smoothing_curves += [smoothing_curve] * prefill_len
                 xtc_thresholds += [xtc_threshold] * prefill_len
                 xtc_probabilities += [xtc_probability] * prefill_len
+                dry_multipliers += [dry_multiplier] * prefill_len
+                dry_bases += [dry_base] * prefill_len
+                dry_allowed_lengths += [dry_allowed_length] * prefill_len
+                dry_sequence_breakers += [dry_sequence_breakers] * prefill_len
 
             if seq_group.do_sample:
                 sample_lens = len(seq_group.sample_indices)
@@ -565,6 +584,10 @@ class SamplingTensors:
                 smoothing_curves += [smoothing_curve] * len(seq_ids)
                 xtc_thresholds += [xtc_threshold] * len(seq_ids)
                 xtc_probabilities += [xtc_probability] * len(seq_ids)
+                dry_multipliers += [dry_multiplier] * len(seq_ids)
+                dry_bases += [dry_base] * len(seq_ids)
+                dry_allowed_lengths += [dry_allowed_length] * len(seq_ids)
+                dry_sequence_breakers += [dry_sequence_breakers] * len(seq_ids)
 
             if _USE_TRITON_SAMPLER:
                 if is_prompt:
@@ -611,11 +634,12 @@ class SamplingTensors:
             tfss, eta_cutoffs, epsilon_cutoffs, typical_ps, smoothing_factors,
             smoothing_curves, xtc_thresholds, xtc_probabilities,sampling_seeds,
             sample_indices, prompt_tokens, output_tokens, vocab_size,
-            extra_seeds_to_generate, device, dtype)
+            extra_seeds_to_generate, device, dtype, dry_multipliers,
+            dry_bases, dry_allowed_lengths, dry_sequence_breakers)
         return (sampling_tensors, do_penalties, do_temperatures,
                 do_top_p_top_k, do_top_as, do_min_p, do_tfss, do_eta_cutoffs,
                 do_epsilon_cutoffs, do_typical_ps, do_quadratic, do_xtc,
-                do_temp_last)
+                do_temp_last, do_dry)
 
     @classmethod
     def from_lists(cls, temperatures: List[float], dynatemp_mins: List[float],
@@ -632,7 +656,9 @@ class SamplingTensors:
                    sample_indices: List[int], prompt_tokens: List[array],
                    output_tokens: List[array], vocab_size: int,
                    extra_seeds_to_generate: int, device: torch.device,
-                   dtype: torch.dtype) -> "SamplingTensors":
+                   dtype: torch.dtype, dry_multipliers: List[float],
+                   dry_bases: List[float], dry_allowed_lengths: List[int],
+                   dry_sequence_breakers: List[str]) -> "SamplingTensors":
         # Note that the performance will be very bad without
         # pinned memory.
         pin_memory = is_pin_memory_available()
@@ -775,6 +801,30 @@ class SamplingTensors:
             dtype=torch.long,
             pin_memory=pin_memory,
         ).t().contiguous()
+        dry_multipliers_t = torch.tensor(
+            dry_multipliers,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        dry_bases_t = torch.tensor(
+            dry_bases,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        dry_allowed_lengths_t = torch.tensor(
+            dry_allowed_lengths,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        dry_sequence_breakers_t = torch.tensor(
+            [ord(c) for s in dry_sequence_breakers for c in s.strip('"').split('", "')],
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
 
         # Because the memory is pinned, we can do non-blocking
         # transfer to device.
@@ -823,6 +873,10 @@ class SamplingTensors:
             sample_indices=sample_indices_t.to(device=device,
                                                non_blocking=True),
             extra_seeds=extra_seeds_gpu,
+            dry_multipliers=dry_multipliers_t.to(device=device, non_blocking=True),
+            dry_bases=dry_bases_t.to(device=device, non_blocking=True),
+            dry_allowed_lengths=dry_allowed_lengths_t.to(device=device, non_blocking=True),
+            dry_sequence_breakers=dry_sequence_breakers_t.to(device=device, non_blocking=True),
         )
 
     @staticmethod

@@ -145,6 +145,10 @@ class SamplingParams:
             above this threshold, consider removing all but the last one.
         xtc_probability: Probability that the removal will actually happen.
             0 disables the sampler, 1 makes it always happen.
+        dry_multiplier: float = 0.0
+        dry_base: float = 1.75
+        dry_allowed_length: int = 2
+        dry_sequence_breakers: str = '"\\n", ":", "\\"", "*"'
     """
 
     def __init__(
@@ -189,6 +193,10 @@ class SamplingParams:
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         xtc_threshold: float = 0.1,
         xtc_probability: float = 0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_sequence_breakers: str = '"\\n", ":", "\\"", "*"',
     ) -> None:
         self.n = n
         self.best_of = best_of if best_of is not None else n
@@ -253,6 +261,10 @@ class SamplingParams:
             self.output_text_buffer_length = 0
         self.xtc_threshold = xtc_threshold
         self.xtc_probability = xtc_probability
+        self.dry_multiplier = dry_multiplier
+        self.dry_base = dry_base
+        self.dry_allowed_length = dry_allowed_length
+        self.dry_sequence_breakers = dry_sequence_breakers
 
         self.default_values = {
             "n": 1,
@@ -294,6 +306,10 @@ class SamplingParams:
             "truncate_prompt_tokens": None,
             "xtc_threshold": 0.1,
             "xtc_probability": 0,
+            "dry_multiplier": 0.0,
+            "dry_base": 1.75,
+            "dry_allowed_length": 2,
+            "dry_sequence_breakers": '"\\n", ":", "\\"", "*"',
         }
 
         # Number of characters to hold back for stop string evaluation
@@ -397,6 +413,18 @@ class SamplingParams:
             raise ValueError(
                 "xtc_probability must be in [0, 1], got "
                 f"{self.xtc_probability}.")
+        if self.dry_multiplier < 0.0:
+            raise ValueError(
+                "dry_multiplier must be non-negative, got "
+                f"{self.dry_multiplier}.")
+        if self.dry_base < 0.0:
+            raise ValueError(
+                "dry_base must be non-negative, got "
+                f"{self.dry_base}.")
+        if self.dry_allowed_length < 0:
+            raise ValueError(
+                "dry_allowed_length must be non-negative, got "
+                f"{self.dry_allowed_length}.")
 
     def _verify_beam_search(self) -> None:
         if self.best_of == 1:

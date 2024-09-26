@@ -72,7 +72,7 @@ class Sampler(nn.Module):
         # Initialize new sampling tensors
         (sampling_tensors, do_penalties, do_temperatures, do_top_p_top_k,
          do_top_as, do_min_p, do_tfss, do_eta_cutoffs, do_epsilon_cutoffs,
-         do_typical_ps, do_quadratic, do_xtc, do_temp_last
+         do_typical_ps, do_quadratic, do_xtc, do_temp_last, do_dry
          ) = SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype)
 
@@ -89,6 +89,7 @@ class Sampler(nn.Module):
         self._do_quadratic = do_quadratic
         self._do_xtc = do_xtc
         self._do_temp_last = do_temp_last
+        self._do_dry = do_dry
 
     def forward(
         self,
@@ -127,6 +128,7 @@ class Sampler(nn.Module):
         do_quadratic = self._do_quadratic
         do_xtc = self._do_xtc
         do_temp_last = self._do_temp_last
+        do_dry = self._do_dry
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
 
@@ -188,6 +190,16 @@ class Sampler(nn.Module):
         banned_tokens = _get_custom_token_bans(sampling_metadata)
         logits = _apply_token_bans(logits, banned_tokens)
 
+        if do_dry:
+            logits = self._apply_dry(
+                logits,
+                sampling_metadata.input_ids,
+                sampling_tensors.dry_multipliers,
+                sampling_tensors.dry_bases,
+                sampling_tensors.dry_allowed_lengths,
+                sampling_tensors.dry_sequence_breakers,
+            )
+
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
         probs = torch.softmax(logits, dim=-1, dtype=torch.float)
@@ -238,6 +250,48 @@ class Sampler(nn.Module):
         method be encoded into the probability distribution.
         """
         return self.should_modify_greedy_probs_inplace
+
+    def _apply_dry(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        dry_multipliers: torch.Tensor,
+        dry_bases: torch.Tensor,
+        dry_allowed_lengths: torch.Tensor,
+        dry_sequence_breakers: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, vocab_size = logits.shape
+        for i in range(batch_size):
+            last_token = input_ids[i, -1].item()
+            if last_token in dry_sequence_breakers:
+                continue
+
+            match_indices = (input_ids[i, :-1] == last_token).nonzero(as_tuple=True)[0]
+            match_lengths = {}
+
+            for idx in match_indices:
+                next_token = input_ids[i, idx + 1].item()
+                if next_token in dry_sequence_breakers:
+                    continue
+
+                match_length = 1
+                while True:
+                    j = idx - match_length
+                    if j < 0:
+                        break
+                    previous_token = input_ids[i, -(match_length + 1)].item()
+                    if input_ids[i, j] != previous_token or previous_token in dry_sequence_breakers:
+                        break
+                    match_length += 1
+
+                match_lengths[next_token] = max(match_length, match_lengths.get(next_token, 0))
+
+            for token, match_length in match_lengths.items():
+                if match_length >= dry_allowed_lengths[i]:
+                    penalty = dry_multipliers[i] * (dry_bases[i] ** (match_length - dry_allowed_lengths[i]))
+                    logits[i, token] -= penalty
+
+        return logits
 
 
 def _get_bin_counts_and_mask(
